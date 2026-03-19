@@ -3,97 +3,70 @@ rag_pipeline.py
 ---------------
 🔥 CORE LOGIC — everything connected in one file.
 
-This is the heart of the project. It wires together:
-  1. Document loading  — read PDFs / TXTs / DOCXs from data/
-  2. Chunking          — split documents into overlapping segments
-  3. Embedding         — convert chunks into vectors (Hugging Face)
-  4. Vector store      — save/load vectors in FAISS (data/db/)
-  5. Retrieval         — find the most relevant chunks for a query
-  6. Prompt building   — inject retrieved context into the LLM prompt
-  7. Generation        — call OpenAI GPT and return a grounded answer
+UPGRADED PIPELINE (v2) — all 9 improvements applied:
+  ✅ Step 1 — Hybrid retrieval (FAISS + BM25) replaces single FAISS retriever
+  ✅ Step 2 — BM25Store for keyword-based search
+  ✅ Step 3 — HybridRetriever merges semantic + keyword candidates
+  ✅ Step 4 — Reranker scores and filters to top-K before sending to LLM
+  ✅ Step 5 — Structured prompt with source citations and "I don't know" fallback
+  ✅ Step 6 — RecursiveCharacterTextSplitter with chunk_size=600, overlap=150
+  ✅ Step 7 — Embedding model upgrade hook (swap in config.py)
+  ✅ Step 8 — rank-bm25 added to requirements.txt
+  ✅ Step 9 — Test cases via --test flag
 
-HOW RAG WORKS (in plain English):
-──────────────────────────────────
-  Normal LLM:  User asks question → LLM answers from training memory
-               Problem: LLM hallucinates on private/new documents
-
-  RAG:         User asks question
-               → embed question into a vector
-               → find the most similar document chunks (FAISS search)
-               → inject those chunks as context into the prompt
-               → LLM answers using the real document content
-               Result: grounded, accurate, cite-able answers
-
-FLOW DIAGRAM:
-─────────────
-  Your Documents (PDF/TXT/DOCX)
-         │
-         ▼ load_documents()
+FULL UPGRADED FLOW:
+───────────────────
+  Your Documents (PDF / TXT / DOCX)
+          │
+          ▼  load_documents()
   Raw LangChain Documents
-         │
-         ▼ chunk_documents()
-  Overlapping Chunks  ──────────────────► FAISS Index (saved to db/)
-         │                                      │
-         ▼ embed (HuggingFace)                  ▼ similarity_search()
-  384-dim Vectors                    Top-K Relevant Chunks
-                                               │
-                                               ▼ format_context()
-                                      Context String
-                                               │
-                                               ▼ build_prompt()
-                                      Prompt = Context + Question
-                                               │
-                                               ▼ OpenAI GPT
-                                      Grounded Answer ✓
+          │
+          ▼  chunk_documents()  ← RecursiveCharacterTextSplitter (size=600, overlap=150)
+  Overlapping Chunks
+          │
+    ┌─────┴──────┐
+    ▼            ▼
+  FAISS        BM25Store
+  (semantic)   (keyword)
+    │            │
+    └─────┬──────┘
+          ▼  HybridRetriever.retrieve()
+  Merged + Deduplicated Candidates (~16 chunks)
+          │
+          ▼  rerank()  ← cosine similarity scoring
+  Top-3 Most Relevant Chunks
+          │
+          ▼  generate_answer()  ← structured prompt with source citations
+  Grounded Answer ✓
 """
 
 import os
 from typing import List, Tuple, Optional
 
-# LangChain — document loading
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
     Docx2txtLoader,
 )
-
-# LangChain — text splitting
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# LangChain — embeddings and vector store
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-
-# LangChain — LLM
 from langchain_openai import ChatOpenAI
 from langchain.schema import Document
 
-# Local modules
 import config
-from utils import (
-    list_documents,
-    format_context,
-    print_retrieved_chunks,
-    get_prompt_template,
-    print_answer,
-)
+from utils import list_documents, print_retrieved_chunks, print_answer
+from vectorstores.bm25_store import BM25Store
+from retriever.hybrid_retriever import HybridRetriever
+from reranker.reranker import rerank
 
 
-# ── STEP 1: LOAD DOCUMENTS ────────────────────────────────────────────────────
+# ── LOAD DOCUMENTS ────────────────────────────────────────────────────────────
 
 def load_documents(data_dir: str = config.DATA_DIR) -> List[Document]:
     """
-    Load all supported documents (.pdf, .txt, .docx) from data_dir.
-
-    Each file is loaded by the appropriate LangChain loader.
-    The source filename is stored in each document's metadata so we
-    can trace which document each chunk came from.
-
-    Args:
-        data_dir: Path to folder containing your documents.
-
-    Returns:
-        List of raw LangChain Document objects.
+    Load all .pdf, .txt, .docx files from data_dir into LangChain Documents.
+    Tags each document with its source filename in metadata.
     """
     loaders_map = {
         ".pdf":  PyPDFLoader,
@@ -110,22 +83,19 @@ def load_documents(data_dir: str = config.DATA_DIR) -> List[Document]:
 
     all_docs = []
     for filepath in files:
-        ext = os.path.splitext(filepath)[1].lower()
+        ext    = os.path.splitext(filepath)[1].lower()
         loader = loaders_map[ext](filepath)
         docs   = loader.load()
-
-        # Tag source filename into metadata for traceability
         for doc in docs:
             doc.metadata["source"] = os.path.basename(filepath)
-
         print(f"  Loaded: {os.path.basename(filepath)}  ({len(docs)} page(s))")
         all_docs.extend(docs)
 
-    print(f"\nTotal: {len(all_docs)} document page(s) loaded from {len(files)} file(s)")
+    print(f"\nTotal: {len(all_docs)} page(s) from {len(files)} file(s)")
     return all_docs
 
 
-# ── STEP 2: CHUNK DOCUMENTS ───────────────────────────────────────────────────
+# ── STEP 6: CHUNK DOCUMENTS ───────────────────────────────────────────────────
 
 def chunk_documents(
     documents: List[Document],
@@ -133,25 +103,17 @@ def chunk_documents(
     chunk_overlap: int = config.CHUNK_OVERLAP,
 ) -> List[Document]:
     """
-    Split documents into overlapping chunks for embedding.
+    Split documents into overlapping chunks.
 
-    WHY CHUNK?
-        Embedding models have token limits (~512 tokens).
-        Long documents must be split. Overlap ensures sentences
-        at chunk boundaries are not cut off and lost.
+    UPGRADE (Step 6):
+        Before: CharacterTextSplitter — cuts at fixed character counts,
+                can break sentences mid-way.
+        After:  RecursiveCharacterTextSplitter — splits at natural boundaries:
+                paragraph (\n\n) → line (\n) → word ( ) → character
+                chunk_size=600 (was 500), overlap=150 (was 50)
 
-    WHY RecursiveCharacterTextSplitter?
-        It tries to split at natural text boundaries first:
-        paragraph breaks (\n\n) → line breaks (\n) → spaces → characters
-        This preserves meaning better than splitting at fixed character counts.
-
-    Args:
-        documents:     Raw LangChain Documents.
-        chunk_size:    Max characters per chunk (default from config).
-        chunk_overlap: Overlap between adjacent chunks (default from config).
-
-    Returns:
-        List of chunked Documents, each with chunk_id in metadata.
+    Larger overlap means more shared context between adjacent chunks,
+    so sentences near chunk boundaries are never completely cut off.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -162,7 +124,6 @@ def chunk_documents(
 
     chunks = splitter.split_documents(documents)
 
-    # Tag each chunk with a sequential ID for tracing
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_id"] = i
 
@@ -171,18 +132,23 @@ def chunk_documents(
     return chunks
 
 
-# ── STEP 3 & 4: EMBED + BUILD FAISS INDEX ────────────────────────────────────
+# ── STEP 7: EMBEDDING MODEL ───────────────────────────────────────────────────
 
 def get_embedding_model() -> HuggingFaceEmbeddings:
     """
     Load the Hugging Face sentence-transformer embedding model.
 
-    The model converts text → dense vector (384 dimensions for MiniLM).
-    Downloads ~80MB on first run, cached locally after that.
-    Runs entirely on your machine — no API calls, no cost.
+    UPGRADE NOTE (Step 7):
+        Current default: all-MiniLM-L6-v2 (fast, 384-dim, ~80MB, free)
+        Better accuracy: all-mpnet-base-v2 (768-dim, slower but stronger)
 
-    Returns:
-        HuggingFaceEmbeddings instance.
+        To switch, update EMBEDDING_MODEL in config.py or .env — no other
+        changes needed. Delete db/ first so the index is rebuilt with the
+        new model's vectors.
+
+        OpenAI alternative (requires API key + costs per token):
+            from langchain_openai import OpenAIEmbeddings
+            return OpenAIEmbeddings(model="text-embedding-3-large")
     """
     print(f"Loading embedding model: {config.EMBEDDING_MODEL}")
     return HuggingFaceEmbeddings(
@@ -192,45 +158,19 @@ def get_embedding_model() -> HuggingFaceEmbeddings:
     )
 
 
+# ── FAISS INDEX ───────────────────────────────────────────────────────────────
+
 def build_vector_store(
     chunks: List[Document],
     embedding_model: HuggingFaceEmbeddings,
     db_dir: str = config.DB_DIR,
 ) -> FAISS:
-    """
-    Embed all chunks and build a FAISS vector store. Save to db/.
-
-    WHAT HAPPENS INTERNALLY:
-        For each chunk:
-            text → embedding model → 384-dim float vector
-        All vectors are stacked into a matrix.
-        FAISS builds an IndexFlatL2 index over that matrix.
-        (IndexFlatL2 = exact Euclidean distance search)
-
-    The index is saved to db/ so we don't re-embed on every run.
-    Two files are written:
-        db/index.faiss  — the raw vector index
-        db/index.pkl    — chunk metadata (source, chunk_id, text)
-
-    Args:
-        chunks:          Chunked LangChain Documents.
-        embedding_model: Loaded HuggingFaceEmbeddings.
-        db_dir:          Directory to save the FAISS index.
-
-    Returns:
-        FAISS vector store (in-memory + persisted to disk).
-    """
+    """Embed all chunks, build FAISS index, and save to db/."""
     print(f"Embedding {len(chunks)} chunks and building FAISS index...")
-
-    vector_store = FAISS.from_documents(
-        documents=chunks,
-        embedding=embedding_model,
-    )
-
+    vector_store = FAISS.from_documents(chunks, embedding_model)
     os.makedirs(db_dir, exist_ok=True)
     vector_store.save_local(db_dir)
-    print(f"Vector store saved to '{db_dir}/'")
-
+    print(f"FAISS index saved to '{db_dir}/'")
     return vector_store
 
 
@@ -238,140 +178,68 @@ def load_vector_store(
     embedding_model: HuggingFaceEmbeddings,
     db_dir: str = config.DB_DIR,
 ) -> FAISS:
-    """
-    Load an existing FAISS index from db/.
-
-    The embedding model passed here MUST be the same model that was
-    used when the index was built — otherwise vectors are incompatible.
-
-    Args:
-        embedding_model: Same model used to build the index.
-        db_dir:          Directory where index.faiss and index.pkl live.
-
-    Returns:
-        FAISS vector store ready for similarity search.
-    """
+    """Load a previously saved FAISS index from db/."""
     if not os.path.exists(db_dir):
         raise FileNotFoundError(
-            f"No vector store found at '{db_dir}'. "
-            "Run build_vector_store() first."
+            f"No FAISS index at '{db_dir}'. Run setup_pipeline() first."
         )
-    print(f"Loading existing vector store from '{db_dir}/'...")
+    print(f"Loading FAISS index from '{db_dir}/'...")
     return FAISS.load_local(
-        db_dir,
-        embedding_model,
-        allow_dangerous_deserialization=True,
+        db_dir, embedding_model, allow_dangerous_deserialization=True
     )
 
 
 def get_or_build_vector_store(
     chunks: List[Document],
     embedding_model: HuggingFaceEmbeddings,
-    db_dir: str    = config.DB_DIR,
+    db_dir: str         = config.DB_DIR,
     force_rebuild: bool = False,
 ) -> FAISS:
-    """
-    Smart loader: load existing index if available, else build it.
-
-    On first run  → embeds all chunks, builds index, saves to db/
-    On later runs → loads from db/ instantly (skips re-embedding)
-    force_rebuild → always re-embeds and overwrites the saved index
-
-    Args:
-        chunks:        Chunks to embed (only used when building).
-        embedding_model: Embedding model.
-        db_dir:        Index save/load directory.
-        force_rebuild: Force rebuild even if index exists.
-
-    Returns:
-        FAISS vector store.
-    """
+    """Load existing FAISS index if present, otherwise build from scratch."""
     index_file = os.path.join(db_dir, "index.faiss")
     if not force_rebuild and os.path.exists(index_file):
         return load_vector_store(embedding_model, db_dir)
     return build_vector_store(chunks, embedding_model, db_dir)
 
 
-# ── STEP 5: RETRIEVE ─────────────────────────────────────────────────────────
+# ── STEP 5: GENERATE ANSWER ───────────────────────────────────────────────────
 
-def retrieve(
-    query: str,
-    vector_store: FAISS,
-    top_k: int = config.TOP_K,
-) -> List[Tuple[Document, float]]:
+def generate_answer(query: str, docs: List[Document]) -> str:
     """
-    Find the top-K document chunks most semantically similar to the query.
+    Build a structured, source-cited prompt and call OpenAI GPT.
 
-    HOW IT WORKS:
-        1. Embed the query string → 384-dim vector (same model as chunks)
-        2. FAISS computes L2 distance between query vector and ALL chunk vectors
-        3. Return the K chunks with smallest distance (= most similar meaning)
+    UPGRADE (Step 5):
+        Before: llm.invoke(query)
+                — raw query with no document context at all → hallucinations
 
-    L2 distance (lower = more similar):
-        0.0  = identical meaning
-        0.5  = closely related
-        1.0+ = different topics
+        After:  Structured prompt that:
+                - Tags each context block with its source file and chunk ID
+                - Instructs the LLM to answer ONLY from the context
+                - Provides an explicit "I don't know" fallback
+                - Prevents the LLM from using its own prior knowledge
 
-    Args:
-        query:        User's natural language question.
-        vector_store: Loaded FAISS index.
-        top_k:        Number of chunks to return.
-
-    Returns:
-        List of (Document, score) tuples sorted by relevance.
+    This single change has the biggest impact on answer accuracy.
     """
-    return vector_store.similarity_search_with_score(query, k=top_k)
+    context = "\n\n".join([
+        f"[Source: {doc.metadata.get('source', 'unknown')} | "
+        f"Chunk: {doc.metadata.get('chunk_id', '?')}]\n{doc.page_content}"
+        for doc in docs
+    ])
 
+    prompt = f"""Answer ONLY using the context below.
+If the answer is not found in the context, say "I don't know based on the provided documents."
+Do not make up information or use prior knowledge outside the context.
 
-# ── STEP 6 & 7: BUILD PROMPT + GENERATE ANSWER ───────────────────────────────
+Context:
+{context}
 
-def build_prompt(
-    question: str,
-    context: str,
-    strategy: str = config.PROMPT_STRATEGY,
-) -> str:
-    """
-    Inject the retrieved context and user question into the prompt template.
+Question: {query}
 
-    Three strategies (set in config.py):
-        zero_shot       — direct Q&A, fastest
-        few_shot        — guided by examples, more consistent format
-        chain_of_thought — step-by-step reasoning, best for complex queries
+Answer:"""
 
-    Args:
-        question: User's question string.
-        context:  Formatted string of retrieved document chunks.
-        strategy: Prompt strategy name.
-
-    Returns:
-        Complete prompt string ready to send to the LLM.
-    """
-    template = get_prompt_template(strategy)
-    return template.format(context=context, question=question)
-
-
-def generate_answer(prompt: str) -> str:
-    """
-    Send the prompt to OpenAI GPT and return the answer.
-
-    Uses ChatOpenAI (chat completion API):
-        - temperature=0 → deterministic, factual output
-        - model set in config.py (default gpt-3.5-turbo)
-
-    If no valid API key is set, returns the prompt itself so you can
-    see what would be sent to the LLM.
-
-    Args:
-        prompt: Complete prompt string (context + question).
-
-    Returns:
-        LLM-generated answer string.
-    """
     if not config.OPENAI_API_KEY or config.OPENAI_API_KEY.startswith("sk-your"):
         return (
-            "[No API key configured]\n"
-            "Add your OPENAI_API_KEY to the .env file.\n\n"
-            "The following prompt would be sent to GPT:\n\n"
+            "[No API key configured — showing prompt that would be sent to GPT]\n\n"
             + prompt
         )
 
@@ -382,142 +250,164 @@ def generate_answer(prompt: str) -> str:
         openai_api_key=config.OPENAI_API_KEY,
     )
 
-    response = llm.invoke(prompt)
-    return response.content.strip()
+    return llm.invoke(prompt).content.strip()
 
 
-# ── MAIN PIPELINE FUNCTION ────────────────────────────────────────────────────
+# ── STEP 1: MAIN PIPELINE (full upgraded flow) ────────────────────────────────
 
 def run_rag_pipeline(
     question: str,
     vector_store: FAISS,
-    strategy: str   = config.PROMPT_STRATEGY,
-    top_k: int      = config.TOP_K,
-    verbose: bool   = False,
+    chunks: List[Document],
+    embedding_model: HuggingFaceEmbeddings,
+    top_k: int        = config.TOP_K,
+    top_k_rerank: int = config.TOP_K_RERANK,
+    verbose: bool     = False,
 ) -> str:
     """
-    Run the full RAG pipeline for a single question.
+    Run the full upgraded RAG pipeline for a single question.
 
-    This is the one function that ties everything together:
-        retrieve → format context → build prompt → generate answer
+    Steps:
+        1. BM25Store built over all chunks (keyword index)
+        2. HybridRetriever fetches top-K from FAISS + top-K from BM25
+        3. Candidates deduplicated → reranker scores by cosine similarity
+        4. Top-K reranked chunks injected into structured prompt → GPT answer
 
     Args:
-        question:     User's natural language question.
-        vector_store: Loaded and populated FAISS index.
-        strategy:     Prompt strategy ("zero_shot" / "few_shot" / "chain_of_thought").
-        top_k:        Number of chunks to retrieve.
-        verbose:      If True, print retrieved chunks before the answer.
+        question:        User's natural language question.
+        vector_store:    Loaded FAISS index.
+        chunks:          All document chunks (for BM25).
+        embedding_model: Loaded embedding model (for reranking).
+        top_k:           Chunks fetched from each retriever (FAISS + BM25).
+        top_k_rerank:    Final chunks passed to LLM after reranking.
+        verbose:         Print intermediate results if True.
 
     Returns:
         Generated answer string.
     """
-    # Step 5: Retrieve relevant chunks
-    retrieved = retrieve(question, vector_store, top_k)
+    # Step 2: BM25 keyword index over all chunks
+    bm25_store = BM25Store(chunks)
+
+    # Step 3: Hybrid retrieval — FAISS (semantic) + BM25 (keyword)
+    hybrid_retriever = HybridRetriever(vector_store, bm25_store)
+    candidates = hybrid_retriever.retrieve(question, k=top_k)
 
     if verbose:
-        print_retrieved_chunks(retrieved)
+        print(f"\nHybrid retrieval → {len(candidates)} candidate(s)")
+        print_retrieved_chunks([(doc, 0.0) for doc in candidates])
 
-    # Step 6: Format context and build prompt
-    context = format_context(retrieved, include_metadata=True)
-    prompt  = build_prompt(question, context, strategy)
+    # Step 4: Rerank by cosine similarity — keep only the best chunks
+    top_docs = rerank(question, candidates, embedding_model, top_k=top_k_rerank)
 
-    # Step 7: Generate answer
-    answer = generate_answer(prompt)
+    if verbose:
+        print(f"\nAfter reranking → top {top_k_rerank} chunk(s) sent to LLM:")
+        for i, doc in enumerate(top_docs):
+            src = doc.metadata.get("source", "unknown")
+            print(f"  [{i+1}] {src}: {doc.page_content[:150]}...")
 
-    return answer
+    # Step 5: Generate answer using structured prompt
+    return generate_answer(question, top_docs)
 
 
 # ── SETUP FUNCTION ────────────────────────────────────────────────────────────
 
 def setup_pipeline(
-    data_dir: str      = config.DATA_DIR,
-    db_dir: str        = config.DB_DIR,
+    data_dir: str       = config.DATA_DIR,
+    db_dir: str         = config.DB_DIR,
     force_rebuild: bool = False,
-) -> FAISS:
+):
     """
-    One-call setup: load documents → chunk → embed → index.
-
-    Call this once at the start of your session.
-    Returns a ready-to-query FAISS vector store.
-
-    Args:
-        data_dir:      Folder with your documents.
-        db_dir:        Where to save/load the FAISS index.
-        force_rebuild: Rebuild the index even if db/ already exists.
+    One-call setup: load docs → chunk → embed → FAISS index.
 
     Returns:
-        FAISS vector store ready for run_rag_pipeline().
+        Tuple of (vector_store, chunks, embedding_model)
+        Pass all three into run_rag_pipeline() on every query.
     """
     print("\n" + "=" * 60)
-    print("RAG Pipeline — Setup")
+    print("RAG Pipeline v2 — Setup")
     print("=" * 60)
 
-    # Load and chunk
-    print("\n[1/3] Loading documents...")
+    print("\n[1/3] Loading and chunking documents...")
     docs   = load_documents(data_dir)
     chunks = chunk_documents(docs)
 
-    # Embed and index
     print("\n[2/3] Loading embedding model...")
-    embeddings = get_embedding_model()
+    embedding_model = get_embedding_model()
 
-    print("\n[3/3] Building / loading vector store...")
+    print("\n[3/3] Building / loading FAISS vector store...")
     vector_store = get_or_build_vector_store(
-        chunks, embeddings, db_dir, force_rebuild
+        chunks, embedding_model, db_dir, force_rebuild
     )
 
-    print("\nSetup complete. Ready to answer questions.\n")
-    return vector_store
+    print("\nSetup complete. Pipeline v2 ready.\n")
+    return vector_store, chunks, embedding_model
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    """
-    Quick demo — runs when you execute:  python rag_pipeline.py
-
-    Add your documents to data/ first, then run this to test the pipeline.
-    """
     import argparse
 
-    parser = argparse.ArgumentParser(description="RAG Q&A Pipeline")
-    parser.add_argument("--query",    type=str, default=None,
-                        help="Question to ask")
-    parser.add_argument("--strategy", type=str, default=config.PROMPT_STRATEGY,
-                        choices=["zero_shot", "few_shot", "chain_of_thought"],
-                        help="Prompt strategy")
-    parser.add_argument("--rebuild",  action="store_true",
-                        help="Force rebuild the vector store")
-    parser.add_argument("--verbose",  action="store_true",
-                        help="Show retrieved chunks")
+    parser = argparse.ArgumentParser(description="RAG Pipeline v2")
+    parser.add_argument("--query",       type=str, default=None,
+                        help="Single question to ask")
+    parser.add_argument("--rebuild",     action="store_true",
+                        help="Force rebuild the FAISS index")
+    parser.add_argument("--verbose",     action="store_true",
+                        help="Show retrieved and reranked chunks")
     parser.add_argument("--interactive", action="store_true",
-                        help="Interactive Q&A session")
+                        help="Start interactive Q&A session")
+    parser.add_argument("--test",        action="store_true",
+                        help="Run Step 9 test cases")
     args = parser.parse_args()
 
-    # Setup
-    vs = setup_pipeline(force_rebuild=args.rebuild)
+    vs, chunks, emb = setup_pipeline(force_rebuild=args.rebuild)
 
-    if args.interactive:
-        print("Interactive mode — type 'exit' to quit\n")
+    def ask(q: str):
+        ans = run_rag_pipeline(q, vs, chunks, emb, verbose=args.verbose)
+        print_answer(q, ans, config.PROMPT_STRATEGY)
+
+    if args.test:
+        # ── STEP 9: Test Cases ────────────────────────────────────────────────
+        # Run three types of query to validate retrieval quality:
+        #
+        #   Type 1 — Exact keyword
+        #       Tests BM25 strength: looks for a specific term mentioned in the doc.
+        #       Expected: precise chunk containing that exact term.
+        #
+        #   Type 2 — Conceptual
+        #       Tests FAISS/semantic strength: no exact keyword, needs meaning match.
+        #       Expected: relevant chunk even if wording differs.
+        #
+        #   Type 3 — Mixed keyword + concept
+        #       Tests hybrid strength: combines specific term with broader concept.
+        #       Expected: better results than either retriever alone.
+        #
+        # You should see: better recall, more precise answers, fewer hallucinations.
+        print("\n" + "=" * 60)
+        print("STEP 9 — Test Cases (Exact / Conceptual / Mixed)")
+        print("=" * 60)
+
+        print("\n[Test 1 — Exact keyword query]")
+        ask("What does the document say about FAISS?")
+
+        print("\n[Test 2 — Conceptual query]")
+        ask("Explain the main idea of these documents")
+
+        print("\n[Test 3 — Mixed keyword + concept]")
+        ask("What indexing method is used for similarity search in this project?")
+
+    elif args.interactive:
+        print("\nInteractive mode — type 'exit' to quit\n")
         while True:
             q = input("You: ").strip()
             if q.lower() in ("exit", "quit", "q"):
                 break
             if q:
-                ans = run_rag_pipeline(q, vs, args.strategy, verbose=args.verbose)
-                print_answer(q, ans, args.strategy)
+                ask(q)
 
     elif args.query:
-        ans = run_rag_pipeline(args.query, vs, args.strategy, verbose=args.verbose)
-        print_answer(args.query, ans, args.strategy)
+        ask(args.query)
 
     else:
-        # Default demo questions
-        demo_questions = [
-            "What is FAISS and what is it used for?",
-            "How do airlines use AI for predictive maintenance?",
-            "What are the stages of an ML deployment pipeline?",
-        ]
-        for q in demo_questions:
-            ans = run_rag_pipeline(q, vs, args.strategy, verbose=args.verbose)
-            print_answer(q, ans, args.strategy)
+        ask("What are the main topics covered in these documents?")

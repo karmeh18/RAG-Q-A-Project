@@ -1,8 +1,7 @@
-# RAG Q&A Pipeline
+# RAG Q&A Pipeline v2
 
-A clean, production-style **Retrieval-Augmented Generation** system
-that answers questions over your own PDF / TXT / DOCX documents using
-FAISS, Hugging Face embeddings, and OpenAI GPT.
+A production-style **Retrieval-Augmented Generation** system upgraded with
+Hybrid Retrieval (FAISS + BM25), Reranking, and structured prompting.
 
 ---
 
@@ -11,12 +10,21 @@ FAISS, Hugging Face embeddings, and OpenAI GPT.
 ```
 rag_project/
 │
-├── data/               ← put your PDFs / TXTs / DOCXs here
-├── db/                 ← FAISS vector index saved here (auto-created)
+├── data/                        ← put your PDFs / TXTs / DOCXs here
+├── db/                          ← FAISS vector index saved here (auto-created)
 │
-├── rag_pipeline.py     ← 🔥 CORE LOGIC (everything connected)
-├── config.py           ← all settings (model, chunk size, top-k, etc.)
-├── utils.py            ← helper functions (formatting, prompts, display)
+├── rag_pipeline.py              ← 🔥 CORE LOGIC (everything connected)
+├── config.py                    ← all settings (model, chunk size, top-k, etc.)
+├── utils.py                     ← helper functions
+│
+├── vectorstores/
+│   └── bm25_store.py            ← BM25 keyword retrieval (Step 2)
+│
+├── retriever/
+│   └── hybrid_retriever.py      ← FAISS + BM25 combined (Step 3)
+│
+├── reranker/
+│   └── reranker.py              ← cosine similarity reranking (Step 4)
 │
 ├── requirements.txt
 └── README.md
@@ -24,102 +32,89 @@ rag_project/
 
 ---
 
-## How RAG Works
+## Upgraded Pipeline Flow
 
 ```
 Your Documents (PDF / TXT / DOCX)
         │
         ▼  load_documents()
-Raw text pages
+Raw LangChain Documents
         │
         ▼  chunk_documents()
-Overlapping chunks ──────────────────► FAISS Index (saved to db/)
-        │                                      │
-        ▼  HuggingFace embedding model         ▼  similarity_search()
-  384-dim vectors                    Top-K relevant chunks
-                                               │
-                                               ▼  build_prompt()
-                                     Context + Question
-                                               │
-                                               ▼  OpenAI GPT
-                                     Grounded Answer ✓
+        │  RecursiveCharacterTextSplitter (size=600, overlap=150)
+Overlapping Chunks
+        │
+   ┌────┴─────┐
+   ▼          ▼
+ FAISS      BM25Store
+ semantic   keyword
+   │          │
+   └────┬─────┘
+        ▼  HybridRetriever.retrieve()
+Merged + Deduplicated Candidates
+        │
+        ▼  rerank()
+Top-3 Most Relevant Chunks
+        │
+        ▼  generate_answer()
+Grounded Answer ✓
 ```
-
-**Why RAG over plain GPT?**
-Standard LLMs hallucinate on private or recent documents because they
-have no access to that content. RAG retrieves the *actual* relevant
-text at query time and injects it as context — so the LLM answers from
-your documents, not from imagination.
 
 ---
 
-## Quick Start
+## What Was Upgraded (All 9 Steps)
 
-### 1. Install dependencies
+| Step | Change | Why |
+|---|---|---|
+| 1 | Hybrid retrieval replaces single FAISS | Better recall — catches both semantic and keyword matches |
+| 2 | BM25Store added | Exact keyword matching for technical terms, acronyms, names |
+| 3 | HybridRetriever merges FAISS + BM25 | Deduplicates and combines both candidate sets |
+| 4 | Reranker added | Filters ~16 candidates down to top-3 before LLM call |
+| 5 | Structured prompt with source citations | Prevents hallucination, adds "I don't know" fallback |
+| 6 | RecursiveCharacterTextSplitter, size=600, overlap=150 | Natural boundary splitting, more context overlap |
+| 7 | Embedding model upgrade hook in config.py | Easy swap to stronger model without code changes |
+| 8 | rank-bm25 added to requirements.txt | BM25 dependency |
+| 9 | --test flag runs all 3 query types | Validates exact, conceptual, and mixed retrieval |
+
+---
+
+## Setup
+
 ```bash
+# 1. Install dependencies
 pip install -r requirements.txt
-```
 
-### 2. Set your OpenAI API key
-```bash
+# 2. Set your OpenAI API key
 cp .env.example .env
-# Edit .env and set OPENAI_API_KEY=sk-...
+# Edit .env → OPENAI_API_KEY=sk-...
+
+# 3. Add your documents to data/
+# Supported: .pdf  .txt  .docx
+
+# 4. Run
+python rag_pipeline.py --query "What are the main topics?"
 ```
 
-### 3. Add your documents
-Drop any `.pdf`, `.txt`, or `.docx` files into the `data/` folder.
+---
 
-### 4. Run
+## Usage
 
-**Single question:**
 ```bash
-python rag_pipeline.py --query "What are the main topics in these documents?"
-```
+# Single question
+python rag_pipeline.py --query "What does the document say about X?"
 
-**Interactive mode (chat session):**
-```bash
-python rag_pipeline.py --interactive
-```
-
-**Change prompt strategy:**
-```bash
-python rag_pipeline.py --query "Explain the deployment stages" --strategy chain_of_thought
-```
-
-**Force rebuild the vector index:**
-```bash
-python rag_pipeline.py --query "..." --rebuild
-```
-
-**Show retrieved chunks (debug):**
-```bash
+# Show retrieved chunks (debug mode)
 python rag_pipeline.py --query "..." --verbose
+
+# Interactive session
+python rag_pipeline.py --interactive
+
+# Run Step 9 test cases (exact / conceptual / mixed)
+python rag_pipeline.py --test
+
+# Force rebuild the FAISS index (after adding new documents)
+python rag_pipeline.py --rebuild --query "..."
 ```
-
----
-
-## Configuration (`config.py`)
-
-| Setting | Default | Description |
-|---|---|---|
-| `LLM_MODEL` | `gpt-3.5-turbo` | OpenAI model (`gpt-4o` for higher quality) |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | HuggingFace embedding model |
-| `CHUNK_SIZE` | `500` | Max characters per document chunk |
-| `CHUNK_OVERLAP` | `50` | Overlap between adjacent chunks |
-| `TOP_K` | `4` | Number of chunks retrieved per query |
-| `PROMPT_STRATEGY` | `zero_shot` | Prompt style (see below) |
-
----
-
-## Prompt Strategies
-
-| Strategy | Best For | Trade-off |
-|---|---|---|
-| `zero_shot` | Clear, factual questions | Fast, low token cost |
-| `few_shot` | Structured or formatted output | Slightly more tokens |
-| `chain_of_thought` | Complex, multi-part questions | Most accurate, most tokens |
-
-Change the default in `config.py` or pass `--strategy` at runtime.
 
 ---
 
@@ -128,14 +123,15 @@ Change the default in `config.py` or pass `--strategy` at runtime.
 ```python
 from rag_pipeline import setup_pipeline, run_rag_pipeline
 
-# Build once
-vector_store = setup_pipeline()
+# Build once at startup
+vector_store, chunks, embedding_model = setup_pipeline()
 
 # Query as many times as you want
 answer = run_rag_pipeline(
     question="What is the main finding?",
     vector_store=vector_store,
-    strategy="chain_of_thought",
+    chunks=chunks,
+    embedding_model=embedding_model,
     verbose=True,
 )
 print(answer)
@@ -143,15 +139,43 @@ print(answer)
 
 ---
 
+## Configuration (`config.py`)
+
+| Setting | Default | Description |
+|---|---|---|
+| `LLM_MODEL` | `gpt-3.5-turbo` | OpenAI model — swap to `gpt-4o` for higher quality |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | HuggingFace model — swap to `all-mpnet-base-v2` for better accuracy |
+| `CHUNK_SIZE` | `600` | Max characters per chunk |
+| `CHUNK_OVERLAP` | `150` | Overlap between adjacent chunks |
+| `TOP_K` | `8` | Chunks fetched from each retriever (FAISS + BM25) |
+| `TOP_K_RERANK` | `3` | Final chunks sent to LLM after reranking |
+
+---
+
+## Step 9 — Test Query Types
+
+After running `python rag_pipeline.py --test` you should see:
+
+| Test Type | Example Query | What It Validates |
+|---|---|---|
+| Exact keyword | "What does the document say about FAISS?" | BM25 finds the exact term |
+| Conceptual | "Explain the main idea of these documents" | FAISS finds semantic meaning |
+| Mixed | "What indexing method is used for similarity search?" | Hybrid outperforms either alone |
+
+Expected outcomes: better recall, more precise answers, fewer hallucinations.
+
+---
+
 ## How to Explain This in an Interview
 
-> "I built a RAG pipeline to solve hallucination on private documents.
-> Instead of relying on the LLM's training memory, I retrieve the actual
-> relevant text at query time by embedding both the documents and the query
-> using a Hugging Face sentence-transformer, then doing nearest-neighbour
-> search with FAISS. The retrieved chunks are injected as context into a
-> structured prompt before calling GPT. I implemented three prompting
-> strategies — zero-shot, few-shot, and chain-of-thought — and the entire
-> pipeline is modular: config.py controls all settings, utils.py handles
-> shared helpers, and rag_pipeline.py is the single core file that connects
-> every stage from document ingestion to answer generation."
+> "I upgraded a basic RAG pipeline with three key improvements.
+> First, I added hybrid retrieval combining FAISS semantic search with BM25
+> keyword search — FAISS finds conceptually related content while BM25 catches
+> exact technical terms and acronyms, and together they produce higher recall
+> than either alone. Second, I added a reranker that scores all candidates by
+> cosine similarity to the query and keeps only the top-3 before calling the LLM
+> — this reduces noise, cuts token cost, and improves answer precision.
+> Third, I upgraded the prompt to a structured template with source citations
+> and an explicit I-don't-know fallback, which significantly reduces hallucination.
+> The entire pipeline is modular — config.py controls all settings and you can
+> swap the embedding model or LLM without touching pipeline code."

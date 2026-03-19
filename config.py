@@ -28,13 +28,18 @@ EMBEDDING_MODEL = os.getenv(
 # ── Document chunking ─────────────────────────────────────────────────────────
 # CHUNK_SIZE:    max characters per chunk
 # CHUNK_OVERLAP: characters shared between adjacent chunks (preserves context at boundaries)
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",    500))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP",  50))
+# Step 6 upgrade: larger chunks (600) + more overlap (150) → better context preservation
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",    600))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 150))
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
-# How many chunks to retrieve per query.
-# More = richer context, but costs more tokens and may add noise.
-TOP_K = int(os.getenv("TOP_K", 4))
+# TOP_K: chunks fetched from EACH retriever (FAISS and BM25) in hybrid mode.
+# Combined candidates = up to 2 x TOP_K before reranking deduplicates them.
+TOP_K = int(os.getenv("TOP_K", 8))
+
+# TOP_K_RERANK: final number of chunks passed to the LLM after reranking.
+# Keep this small (3–5) — tight context = fewer hallucinations, lower token cost.
+TOP_K_RERANK = int(os.getenv("TOP_K_RERANK", 3))
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR  = "data"   # put your PDFs / TXTs / DOCXs here
